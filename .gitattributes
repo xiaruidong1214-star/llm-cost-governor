@@ -1,0 +1,14 @@
+# 仓库内统一使用 LF：CI 跑在 Linux，Windows 上检出 CRLF 会让 shell 脚本与
+# 多行配置出现难以定位的差异。二进制文件不参与转换。
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+*.xlsx binary
+*.docx binary

@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# CI 中不依赖真实 Redis：
+# 全部测试通过 tests/conftest.py 里的 FakeRedis 替身完成，
+# fakeredis 只在显式设置 CG_TEST_REDIS_URL 时才会被使用（默认不设置）。
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: 代码风格
+        # 与姊妹项目 code-review-bot 使用同一套规则集（见 pyproject.toml 的 [tool.ruff]）
+        run: ruff check costgovernor tests
+      - name: 运行测试
+        run: python -m pytest -q
+      - name: CLI 冒烟测试
+        run: |
+          python -m costgovernor.cli --help
+          python -m costgovernor.cli price-check --model deepseek-flash
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 验证镜像可构建
+        run: docker build -t llm-cost-governor:ci .
+      - name: 验证镜像入口可执行
+        run: docker run --rm llm-cost-governor:ci price-check --model deepseek-v4-pro

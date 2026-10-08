@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-cost-governor"
+version = "2.0.0"
+description = "LLM 可观测性与成本治理中间件：按百万 tokens 计价、Redis 原子幂等入账、真实分位数与 MAD 离群检测。"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "夏瑞东", email = "1716814989@qq.com" }]
+keywords = ["llm", "cost", "observability", "redis", "anomaly-detection"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "redis>=5.0",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.2",
+  "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "fakeredis>=2.23", "ruff>=0.4"]
+worker = ["celery>=5.3"]
+
+[project.scripts]
+costgov = "costgovernor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/xiaruidong1214-star/llm-cost-governor"
+Source = "https://github.com/xiaruidong1214-star/llm-cost-governor"
+Issues = "https://github.com/xiaruidong1214-star/llm-cost-governor/issues"
+Pricing = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
+
+[tool.setuptools]
+packages = ["costgovernor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+# 与姊妹项目 code-review-bot 保持同一套门禁规则，避免两个仓库风格漂移
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]

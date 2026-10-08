@@ -1,0 +1,46 @@
+# 本地一键起：redis + app
+# 注意：app 服务只做导入自检，不会在启动时连接 Redis；
+# 真正探测 Redis 需要用 `docker compose run --rm app report --redis-url redis://redis:6379/0`
+services:
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-cost-governor:local
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      CG_REDIS_URL: redis://redis:6379/0
+      CG_KEY_PREFIX: llm
+      CG_TTL_SECONDS: "172800"
+      CG_TIMEZONE: Asia/Shanghai
+      CG_MIN_SAMPLE_SIZE: "30"
+      CG_MAD_THRESHOLD: "3.5"
+      CG_RETRY_WINDOW_SECONDS: "60"
+      CG_RETRY_MAX_CALLS: "8"
+      CG_LOG_LEVEL: INFO
+    # 覆盖 Dockerfile 的 CMD：只做一次导入自检，随后退出
+    command: ["--help"]
+    restart: "no"
