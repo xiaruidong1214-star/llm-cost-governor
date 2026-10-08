@@ -685,3 +685,63 @@ def test_token_total_key_gets_all_three_fields(any_redis, settings) -> None:
     assert tokens["cache_miss_tokens"] == _q("2000")
     assert tokens["output_tokens"] == _q("500")
 
+
+def test_real_backend_is_actually_available() -> None:
+    """主动断言「真实 Redis 真的连得上且 Lua 真的能跑」。
+
+    CI 里有一个专门步骤只跑这条用例（`-k real_backend_is_actually_available`）。
+    它存在的意义是防止两类**假绿灯**：
+      1) Redis service 没起来 → [real] 用例被静默 skip，整体仍显示通过；
+      2) 固件参数写错 → 根本没收集到 [real] 用例。
+
+    这条测试不依赖解析 pytest 的输出格式（那种做法在 CI 上真实踩过：
+    pytest 9 的 `--collect-only -q` 只输出「文件: 用例数」汇总，抓不到 [real] 标记）。
+
+    行为约定：
+      * 未设置 ``CG_TEST_REDIS_URL`` → **skip**（本地无 Redis 时全量测试保持绿色）；
+      * 设置了但连不上 / Lua 跑不通 → **失败**（CI 门禁因此变红）。
+    """
+    import os
+
+    from costgovernor.storage import IDEMPOTENT_ACCRUAL_LUA
+
+    url = os.environ.get("CG_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("未设置 CG_TEST_REDIS_URL：真实 Redis 验证被跳过（CI 会因本用例 skip 而失败）")
+
+    import redis as _redis
+
+    client = _redis.Redis.from_url(url, decode_responses=True)
+    try:
+        assert client.ping(), f"真实 Redis 不可达: {url}"
+        # 真的跑一次 Lua：替身不做语法/下标校验，这一步才是有效验证
+        result = client.eval("return {1, ARGV[1], KEYS[1]}", 1, "costgov:probe", "ok")
+        assert result[0] == 1
+        assert result[1] == "ok"
+        assert result[2] == "costgov:probe"
+
+        # 用一个最小但形状正确的 KEYS/ARGV 跑一遍真实脚本，
+        # 确认 Lua 语法与下标在真实 Redis 上可执行（不是替身分派）。
+        keys = [
+            "costgov:probe:dedup",
+            "costgov:probe:total",
+            "costgov:probe:axis:model",
+            "costgov:probe:days",
+            "costgov:probe:axes",
+        ]
+        argv = ["probe-trace", "0.1", "600", "600", "600", "2026-10-08", "model", "deepseek-flash"]
+        raw = client.eval(IDEMPOTENT_ACCRUAL_LUA, len(keys), *keys, *argv)
+        assert raw[0] == 0  # 非重复
+        assert raw[1] == "deepseek-flash", f"applied_to 应为轴取值，实际 {raw[1]}"
+        # 关键：总账 field 必须是「轴取值」，而不是轴名
+        assert client.hgetall("costgov:probe:total") == {"deepseek-flash": "0.1"}
+        assert client.hgetall("costgov:probe:axis:model") == {"deepseek-flash": "0.1"}
+        assert client.smembers("costgov:probe:days") == {"2026-10-08"}
+        assert client.smembers("costgov:probe:axes") == {"model"}
+    finally:
+        # 清理探针 key，避免污染测试库
+        for key in client.keys("costgov:probe*"):
+            client.delete(key)
+        client.close()
+
+

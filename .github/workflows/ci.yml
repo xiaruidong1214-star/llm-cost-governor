@@ -52,20 +52,14 @@ jobs:
         run: |
           python -m costgovernor.cli --help
           python -m costgovernor.cli price-check --model deepseek-flash
-      - name: 断言真实 Redis 用例没有被全部跳过
-        # 防止「service 挂了导致 [real] 全跳过」被当成绿灯放过去
-        run: |
-          python - <<'PY'
-          import subprocess, sys
-          out = subprocess.run(
-              [sys.executable, "-m", "pytest", "-q", "--collect-only", "-k", "real"],
-              capture_output=True, text=True, encoding="utf-8",
-          ).stdout
-          n = sum(1 for line in out.splitlines() if "[real]" in line)
-          print(f"收集到 {n} 个 [real] 用例")
-          if n == 0:
-              sys.exit("没有收集到任何 [real] 用例：CG_TEST_REDIS_URL 或固件参数可能失效")
-          PY
+      - name: 断言真实 Redis 真的可用（防止假绿灯）
+        # 防止两种"假绿灯"：
+        #   1) Redis service 挂了导致 [real] 用例全部 skip；
+        #   2) 固件参数写错导致根本没收集到 [real] 用例。
+        # 做法是只跑一条**断言式**用例（它真的连 Redis 并执行一次 Lua），
+        # 而不是解析 pytest 的输出文本 —— 后者在 CI 上真实踩过坑：
+        # pytest 9 的 `--collect-only -q` 只输出「文件: 用例数」汇总，抓不到 [real] 标记。
+        run: python -m pytest tests -k "real_backend_is_actually_available" -v
 
   docker-build:
     name: docker build
