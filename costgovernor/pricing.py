@@ -161,37 +161,38 @@ def parse_peak_windows(spec: str | Sequence[str]) -> tuple[PeakWindow, ...]:
 
 
 @dataclass(frozen=True, slots=True)
-class ModelPricing:
-    """单个模型的价格档。
+class PriceBand:
+    """一个**生效区间**内的价格。
 
-    字段命名规则：``<token 种类>_<缓存档>_<时段>``，单位见 :data:`PRICE_UNIT`。
-    token 种类只有两种：``input`` / ``output``；
-    缓存档两种：``cache_hit`` / ``cache_miss``（命中价可能是未命中的 1/25）；
-    时段两种：``peak`` / ``off_peak``。
+    为什么需要它：只有单一 ``effective_date`` 时，官方一调价，**历史区间**就会被
+    用新价重算——这正是本模块声称要解决的问题（旧版没有生效日期概念）的残留同类问题。
+    有了区间，1 月的账单永远按 1 月的价算。
+
+    ``until`` 为 ``None`` 表示"至今有效"。
     """
 
-    model: str
-    effective_date: str
+    effective_from: str
     input_cache_hit_peak: Decimal
     input_cache_hit_off_peak: Decimal
     input_cache_miss_peak: Decimal
     input_cache_miss_off_peak: Decimal
     output_peak: Decimal
     output_off_peak: Decimal
-    currency: str = "CNY"
-    source_url: str = PRICE_SOURCE_URL
-    checked_at: str = PRICE_CHECKED_AT
+    until: str | None = None
 
-    # -------- 查询 --------
+    def covers(self, day: str) -> bool:
+        """``day`` 为 ``YYYY-MM-DD``；区间为**左闭右闭**。"""
+        if day < self.effective_from:
+            return False
+        return self.until is None or day <= self.until
+
     def rate(self, kind: str, cache_tier: str, tier: str) -> Decimal:
         """返回单价（元 / 百万 tokens）。"""
         if kind == "input":
             if cache_tier == "cache_hit":
                 return self.input_cache_hit_peak if tier == "peak" else self.input_cache_hit_off_peak
             if cache_tier == "cache_miss":
-                return (
-                    self.input_cache_miss_peak if tier == "peak" else self.input_cache_miss_off_peak
-                )
+                return self.input_cache_miss_peak if tier == "peak" else self.input_cache_miss_off_peak
             raise ValueError(f"未知的缓存档 {cache_tier!r}，期望 'cache_hit' 或 'cache_miss'")
         if kind == "output":
             if cache_tier != "cache_miss":
@@ -200,17 +201,99 @@ class ModelPricing:
             return self.output_peak if tier == "peak" else self.output_off_peak
         raise ValueError(f"未知的 token 种类 {kind!r}，期望 'input' 或 'output'")
 
+
+@dataclass(frozen=True, slots=True)
+class ModelPricing:
+    """单个模型的**全部生效区间**，按 ``effective_from`` 升序存放。
+
+    为兼容旧的单档写法，保留了扁平的单价字段作为便捷构造入口
+    （见 :func:`single_band_pricing`）；内部查询一律走 :attr:`bands`。
+    """
+
+    model: str
+    bands: tuple[PriceBand, ...]
+    currency: str = "CNY"
+    source_url: str = PRICE_SOURCE_URL
+    checked_at: str = PRICE_CHECKED_AT
+
+    def __post_init__(self) -> None:
+        if not self.bands:
+            raise ValueError(f"模型 {self.model!r} 至少需要一个价格区间")
+        starts = [band.effective_from for band in self.bands]
+        if starts != sorted(starts):
+            raise ValueError(f"模型 {self.model!r} 的价格区间必须按 effective_from 升序排列")
+
+    # -------- 便捷访问 --------
+    @property
+    def effective_date(self) -> str:
+        """最早生效日期（兼容旧字段名）。"""
+        return self.bands[0].effective_from
+
+    @property
+    def latest(self) -> PriceBand:
+        """当前（最后一段）价格。"""
+        return self.bands[-1]
+
+    def band_for(self, day: str) -> PriceBand | None:
+        """返回覆盖 ``day`` 的区间；没有任何区间覆盖则返回 ``None``。"""
+        for band in self.bands:
+            if band.covers(day):
+                return band
+        return None
+
+    # -------- 查询（默认使用最后一段，便于不关心历史时直接调用）--------
+    def rate(self, kind: str, cache_tier: str, tier: str) -> Decimal:
+        return self.latest.rate(kind, cache_tier, tier)
+
     def as_flat_dict(self, tier: str) -> dict[str, str]:
-        """给 CLI/报表用的扁平展示字典。"""
+        """给 CLI/报表用的扁平展示字典（展示当前生效区间）。"""
+        band = self.latest
         return {
             "model": self.model,
-            "effective_date": self.effective_date,
+            "effective_date": band.effective_from,
+            "until": band.until or "至今",
             "tier": tier,
-            "cache_hit_input": str(self.rate("input", "cache_hit", tier)),
-            "cache_miss_input": str(self.rate("input", "cache_miss", tier)),
-            "output": str(self.rate("output", "cache_miss", tier)),
+            "cache_hit_input": str(band.rate("input", "cache_hit", tier)),
+            "cache_miss_input": str(band.rate("input", "cache_miss", tier)),
+            "output": str(band.rate("output", "cache_miss", tier)),
             "unit": PRICE_UNIT,
         }
+
+
+def single_band_pricing(
+    *,
+    model: str,
+    effective_date: str,
+    input_cache_hit_peak: Decimal,
+    input_cache_hit_off_peak: Decimal,
+    input_cache_miss_peak: Decimal,
+    input_cache_miss_off_peak: Decimal,
+    output_peak: Decimal,
+    output_off_peak: Decimal,
+    until: str | None = None,
+    currency: str = "CNY",
+    source_url: str = PRICE_SOURCE_URL,
+    checked_at: str = PRICE_CHECKED_AT,
+) -> ModelPricing:
+    """用单档扁平参数构造 :class:`ModelPricing`（旧写法的适配入口）。"""
+    return ModelPricing(
+        model=model,
+        bands=(
+            PriceBand(
+                effective_from=effective_date,
+                until=until,
+                input_cache_hit_peak=input_cache_hit_peak,
+                input_cache_hit_off_peak=input_cache_hit_off_peak,
+                input_cache_miss_peak=input_cache_miss_peak,
+                input_cache_miss_off_peak=input_cache_miss_off_peak,
+                output_peak=output_peak,
+                output_off_peak=output_off_peak,
+            ),
+        ),
+        currency=currency,
+        source_url=source_url,
+        checked_at=checked_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,20 +349,35 @@ class PricingProfile:
 
     # -------- 价格查询 --------
     def pricing_for(self, model: str, at: datetime) -> ModelPricing:
-        """取某模型在某时刻适用的价格档，并校验生效日期。"""
+        """取某模型的价格表（含全部区间）。
+
+        注意：返回的是**整个模型**的价格表，具体单价请用 :meth:`band_for_time`。
+        保留这个方法是为了兼容既有调用方。
+        """
         try:
-            pricing = self.models[model]
+            return self.models[model]
         except KeyError:
             raise UnknownModelError(model, self.models) from None
 
-        local = self.localize(at)
-        if local.strftime("%Y-%m-%d") < pricing.effective_date:
-            raise PricingNotEffectiveError(model, local, pricing.effective_date)
-        return pricing
+    def band_for_time(self, model: str, at: datetime) -> PriceBand:
+        """取**计费时刻所属区间**的价格。
+
+        计费时刻早于该模型最早区间时抛 :class:`PricingNotEffectiveError` ——
+        宁可报错也不要拿一个不属于那个时期的价格去算历史账。
+        """
+        pricing = self.pricing_for(model, at)
+        day = self.localize(at).strftime("%Y-%m-%d")
+        band = pricing.band_for(day)
+        if band is None:
+            raise PricingNotEffectiveError(model, self.localize(at), pricing.effective_date)
+        return band
 
     def rate_for(self, model: str, kind: str, cache_tier: str, at: datetime) -> Decimal:
-        """某个模型、某个 token 种类/缓存档、某个时刻的单价（元 / 百万 tokens）。"""
-        return self.pricing_for(model, at).rate(kind, cache_tier, self.tier_for(at))
+        """某个模型、某个 token 种类/缓存档、某个时刻的单价（元 / 百万 tokens）。
+
+        单价来自**该时刻所属的价格区间**，因此调价不会污染历史账单。
+        """
+        return self.band_for_time(model, at).rate(kind, cache_tier, self.tier_for(at))
 
     def known_models(self) -> tuple[str, ...]:
         return tuple(sorted(self.models))
@@ -315,7 +413,7 @@ def _beijing_tzinfo() -> tzinfo:
 MODEL_PRICING: dict[str, ModelPricing] = {
     # deepseek-flash：输入未命中 空闲 1 元 / 高峰 2 元；输出 空闲 4 元 / 高峰 8 元；
     # 缓存命中 空闲 0.02 元 / 高峰 0.04 元（恰好是未命中价的 1/50）。
-    "deepseek-flash": ModelPricing(
+    "deepseek-flash": single_band_pricing(
         model="deepseek-flash",
         effective_date="2026-01-01",
         input_cache_hit_off_peak=Decimal("0.02"),
@@ -327,7 +425,7 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     ),
     # deepseek-v4-pro：输入未命中 空闲 4.5 元 / 高峰 9.0 元；输出 空闲 13.5 元 / 高峰 27.0 元；
     # 缓存命中 空闲 0.15 元 / 高峰 0.30 元（未命中价的 1/30）。
-    "deepseek-v4-pro": ModelPricing(
+    "deepseek-v4-pro": single_band_pricing(
         model="deepseek-v4-pro",
         effective_date="2026-01-01",
         input_cache_hit_off_peak=Decimal("0.15"),
@@ -338,7 +436,7 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         output_peak=Decimal("27.0"),
     ),
     # 旧模型名仍可调用，按 Flash 价格计费（官方脚注 1）。
-    "deepseek-v4-flash": ModelPricing(
+    "deepseek-v4-flash": single_band_pricing(
         model="deepseek-v4-flash",
         effective_date="2026-01-01",
         input_cache_hit_off_peak=Decimal("0.02"),

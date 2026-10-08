@@ -220,23 +220,37 @@ def test_unknown_model_also_raises_via_profile() -> None:
 
 def test_pricing_not_effective_raises() -> None:
     """生效日期之前的调用要报错，而不是拿新价格去解释历史数据。"""
-    from dataclasses import replace
 
-    future = replace(
-        MODEL_PRICING["deepseek-flash"],
+    # ModelPricing 现在持有「区间列表」，构造一个未来才生效的单区间模型
+    from decimal import Decimal
+
+    from costgovernor.pricing import PriceBand, single_band_pricing
+
+    source = MODEL_PRICING["deepseek-flash"].latest
+    future = single_band_pricing(
         model="future-model",
         effective_date="2026-12-01",
+        input_cache_hit_peak=source.input_cache_hit_peak,
+        input_cache_hit_off_peak=source.input_cache_hit_off_peak,
+        input_cache_miss_peak=source.input_cache_miss_peak,
+        input_cache_miss_off_peak=source.input_cache_miss_off_peak,
+        output_peak=source.output_peak,
+        output_off_peak=source.output_off_peak,
     )
+    assert isinstance(future.bands[0], PriceBand)
+    assert Decimal("0") < Decimal("1")
     profile = PricingProfile(
         models={"future-model": future},
         timezone=DEFAULT_PRICING.timezone,
         peak_windows=DEFAULT_PRICING.peak_windows,
     )
+    # 校验发生在「取某时刻所属区间」这一步（pricing_for 现在返回整张表）
     with pytest.raises(PricingNotEffectiveError) as excinfo:
-        profile.pricing_for("future-model", THURSDAY_10AM)
+        profile.band_for_time("future-model", THURSDAY_10AM)
     assert "2026-12-01" in str(excinfo.value)
     # 生效之后正常
     assert profile.pricing_for("future-model", datetime(2027, 1, 4, 10)).model == "future-model"
+    assert profile.band_for_time("future-model", datetime(2027, 1, 4, 10)).effective_from == "2026-12-01"
 
 
 def test_every_model_carries_effective_date_and_provenance() -> None:

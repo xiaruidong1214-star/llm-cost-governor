@@ -437,10 +437,19 @@ zadd / zremrangebyscore / zcard / zrange / keys / pipeline / eval`。
 ### 7.1 运行
 
 ```bash
-python -m pytest -q                # 全量（替身后端）
+# 默认：只跑内存替身，本地不需要 Redis
+python -m pytest -q
+
+# 加上真实 Redis 那一档（会在真 Redis 上执行 Lua）
 CG_TEST_REDIS_URL=redis://127.0.0.1:6379/15 python -m pytest -q -rs
-                                   # 额外加上 [real] 参数：在真实 Redis 上跑同一批断言
+
+# 强制要求真实 Redis：不可用（未设置或连不上）直接判失败，而不是跳过
+CG_TEST_REDIS_URL=redis://127.0.0.1:6379/15 CG_REQUIRE_REAL_REDIS=1 python -m pytest -q
 ```
+
+**为什么要有 `CG_REQUIRE_REAL_REDIS`**：默认行为下，Redis 没起来只会让 `[real]` 用例
+静默 skip，整体仍然**显示绿色**——这正是"假绿灯"。CI 里把它设为 `1`，
+于是「Redis service 挂了」会直接让构建失败。
 
 **默认不依赖任何外部服务**：默认后端是内置的 `InMemoryRedis` 替身；
 `fakeredis` 参数只在它**支持 EVAL** 时才会参与
@@ -451,13 +460,17 @@ CG_TEST_REDIS_URL=redis://127.0.0.1:6379/15 python -m pytest -q -rs
 
 | 模式 | 结果 |
 |---|---|
-| 仅替身（不设 `CG_TEST_REDIS_URL`） | `216 passed, 40 skipped` |
-| 含真实 Redis | `236 passed, 20 skipped` |
+| 仅替身（本地，不设 `CG_TEST_REDIS_URL`） | `216 passed, 41 skipped` |
+| 含真实 Redis（不强制） | `237 passed, 20 skipped` |
+| 含真实 Redis + `CG_REQUIRE_REAL_REDIS=1` | `237 passed, 20 skipped`（CI 用这一档） |
+| `CG_REQUIRE_REAL_REDIS=1` 但无 URL | **失败**（门禁按预期生效，已本地验证） |
 
-CI（`.github/workflows/ci.yml`）会起 `redis:7-alpine` service 并设置
-`CG_TEST_REDIS_URL`，因此 CI 跑的是**含真实 Redis** 的那一档。
-另有一个断言步骤检查 `[real]` 用例数量不为 0，防止「service 挂了导致全部跳过」
-被当成绿灯放过去。
+> 20 个 skip 全部是 `fakeredis` 参数（缺 `lupa`），**不是**真实 Redis 那一档。
+
+CI（`.github/workflows/ci.yml`）会起 `redis:7-alpine` service，并设置
+`CG_TEST_REDIS_URL` 与 `CG_REQUIRE_REAL_REDIS=1`，因此 CI 跑的是**强制真实 Redis** 的一档。
+另有一个断言步骤单独跑 `test_real_backend_is_actually_available`：
+它会真的连上去、真的执行一次 Lua、并校验总账 field 是「轴取值」。
 
 ### 7.2 覆盖的回归点（与缺陷一一对应）
 

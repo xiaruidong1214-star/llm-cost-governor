@@ -2,18 +2,25 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    # 只对主分支与版本标签跑完整 CI：`["**"]` 会让每次临时分支推送都占用
+    # 完整矩阵（含 docker build），在按分钟计费的场景下是纯浪费。
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 # CI 中的 Redis：本仓库的 Lua 脚本必须**在真实 Redis 上**验证。
 # 原因：FakeRedis / fakeredis 是按脚本文本分派到等价 Python 实现的替身，
 # 它验证的是「语义契约」，无法发现 Lua 下标错位、key 折叠这类问题
-# （真实踩到过：naxes 公式错、总账写轴名而非轴取值、token 总账 key 与 token 轴 key 折叠）。
-# 因此这里起一个 Redis service，并通过 CG_TEST_REDIS_URL 打开 [real] 参数化用例。
+# （真实踩到过 4 次：naxes 公式错、总账写轴名而非轴取值、索引写反、token key 折叠）。
+#
+# CG_REQUIRE_REAL_REDIS=1 让「真实 Redis 不可用」从"跳过"变成"失败"，
+# 避免 Redis service 没起来却拿到绿灯。
 env:
   PYTHONIOENCODING: utf-8
   PYTHONDONTWRITEBYTECODE: "1"
   CG_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+  CG_REQUIRE_REAL_REDIS: "1"
 
 jobs:
   test:
@@ -48,17 +55,30 @@ jobs:
         run: ruff check costgovernor tests
       - name: 运行测试（含真实 Redis 用例）
         run: python -m pytest -q -rs
+      - name: 依赖安全审计
+        # 只审计声明依赖，不需要可编辑安装；CVE 会随时间变化，
+        # 因此这一步是"随时间变化的信号"，失败时先看是不是新披露的漏洞。
+        run: |
+          python -m pip install pip-audit
+          python - <<'PY'
+          import pathlib, subprocess, sys, tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          req = pathlib.Path("audit-requirements.txt")
+          req.write_text("\n".join(data["project"]["dependencies"]), encoding="utf-8")
+          sys.exit(subprocess.run(
+              [sys.executable, "-m", "pip_audit", "-r", str(req), "--progress-spinner", "off"]
+          ).returncode)
+          PY
       - name: CLI 冒烟测试
         run: |
           python -m costgovernor.cli --help
           python -m costgovernor.cli price-check --model deepseek-flash
       - name: 断言真实 Redis 真的可用（防止假绿灯）
-        # 防止两种"假绿灯"：
-        #   1) Redis service 挂了导致 [real] 用例全部 skip；
-        #   2) 固件参数写错导致根本没收集到 [real] 用例。
-        # 做法是只跑一条**断言式**用例（它真的连 Redis 并执行一次 Lua），
-        # 而不是解析 pytest 的输出文本 —— 后者在 CI 上真实踩过坑：
-        # pytest 9 的 `--collect-only -q` 只输出「文件: 用例数」汇总，抓不到 [real] 标记。
+        # CG_REQUIRE_REAL_REDIS=1 已让 [real] 用例在 Redis 不可用时失败，
+        # 这一步额外跑一条主动断言：真的连上去、真的执行一次 Lua、
+        # 并校验总账 field 是「轴取值」。不解析 pytest 输出文本
+        # （那种做法在 CI 上真实踩过坑：pytest 9 的 --collect-only -q 不输出用例 ID）。
         run: python -m pytest tests -k "real_backend_is_actually_available" -v
 
   docker-build:

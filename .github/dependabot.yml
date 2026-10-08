@@ -1,0 +1,35 @@
+# 依赖自动更新。
+#
+# 为什么要开：本项目依赖 redis / pydantic / structlog，且价格表需要长期维护；
+# 手动跟进依赖容易漏。这里让 bot 每周提一次 PR，CI 会自动验证——
+# **升级必须过测试（含真实 Redis 那一档）**，所以"自动提 PR"不等于"自动合并"。
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      redis-stack:
+        patterns: ["redis*", "fakeredis*"]
+      config-logging:
+        patterns: ["pydantic*", "structlog*"]
+      worker:
+        patterns: ["celery*", "kombu*", "billiard*", "vine*", "amqp*"]
+      dev-tools:
+        patterns: ["pytest*", "ruff*", "pip-audit*"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "docker"]

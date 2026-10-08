@@ -699,15 +699,20 @@ def test_real_backend_is_actually_available() -> None:
 
     行为约定：
       * 未设置 ``CG_TEST_REDIS_URL`` → **skip**（本地无 Redis 时全量测试保持绿色）；
-      * 设置了但连不上 / Lua 跑不通 → **失败**（CI 门禁因此变红）。
+      * 设置了但连不上 / Lua 跑不通 → **失败**（CI 门禁因此变红）；
+      * 设置了 ``CG_REQUIRE_REAL_REDIS=1`` 而没设 URL → 也**失败**（CI 就是这么配的）。
     """
     import os
 
     from costgovernor.storage import IDEMPOTENT_ACCRUAL_LUA
 
     url = os.environ.get("CG_TEST_REDIS_URL")
+    required = os.environ.get("CG_REQUIRE_REAL_REDIS", "").strip().lower() in {"1", "true", "yes"}
     if not url:
-        pytest.skip("未设置 CG_TEST_REDIS_URL：真实 Redis 验证被跳过（CI 会因本用例 skip 而失败）")
+        message = "未设置 CG_TEST_REDIS_URL：真实 Redis 验证被跳过"
+        if required:
+            pytest.fail(f"{message}，但 CG_REQUIRE_REAL_REDIS=1 要求必须验证")
+        pytest.skip(message)
 
     import redis as _redis
 

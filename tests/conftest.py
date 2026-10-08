@@ -1,4 +1,4 @@
-"""测试夹具：FakeRedis 替身与常用固件。
+"""测试夹具：FakeRedis 替身、fakeredis 与**真实 Redis** 三种后端。
 
 为什么要有自己的 ``FakeRedis`` 替身（而不是只用 fakeredis）：
 
@@ -6,12 +6,20 @@
   一旦有人在存储层用了替身不认识的命令，测试会以 ``NotImplementedError`` 立刻失败，
   从而防止命令表面悄悄膨胀；
 * 替身里出现的 ``eval`` **不是真正的 Lua 解释器**（见 ``FakeRedis.eval`` 的注释），
-  它只按脚本文本分派到对应的 Python 实现，用来验证「幂等」「窗口清理」等语义；
-* 测试同时会用 fakeredis（若可用）跑一遍同样的断言，两种后端都通过才算数。
+  它只按脚本文本分派到对应的 Python 实现，用来验证「幂等」「窗口清理」等语义。
 
-本文件**不发起任何真实网络请求**：默认全部走内存替身。
-只有显式设置环境变量 ``CG_TEST_REDIS_URL`` 时，才会额外尝试真实 Redis，
-并且连不上就自动跳过（CI 里从不设置它）。
+**关于"是否发真实网络请求"**（这句话以前写错过，特此写明）：
+
+* 默认（未设置 ``CG_TEST_REDIS_URL``）**不发任何真实连接**，全部走内存替身；
+* 设置 ``CG_TEST_REDIS_URL`` 后，``any_redis`` 会额外加入 ``real`` 参数，
+  **真的连上去、真的执行 Lua**；
+* 设置 ``CG_REQUIRE_REAL_REDIS=1`` 时，「拿不到真实 Redis」不再是跳过而是**失败**。
+  这是防止「Redis 没起来 → 用例静默 skip → 整体仍显示绿灯」的关键开关，
+  CI 里会打开它。
+
+为什么真实 Redis 这一档不能省：替身按脚本标记分派到等价 Python 实现，
+**发现不了 Lua 下标错位、KEYS/ARGV 布局错误、key 折叠**这类问题 ——
+这些在开发中真实发生过 4 次（见 README 第 6 节）。
 """
 
 from __future__ import annotations
@@ -32,6 +40,8 @@ from costgovernor.testing import InMemoryRedis, decode_value
 # FakeRedis 替身
 # ======================================================================================
 _REAL_REDIS_URL = os.environ.get("CG_TEST_REDIS_URL")
+#: 为 1 时，「真实 Redis 不可用」直接判失败，而不是跳过。
+_REQUIRE_REAL_REDIS = os.environ.get("CG_REQUIRE_REAL_REDIS", "").strip().lower() in {"1", "true", "yes"}
 
 
 class FakeRedis(InMemoryRedis):
@@ -122,7 +132,9 @@ def any_redis(request: pytest.FixtureRequest) -> Iterator[Any]:
     因此在有真实 Redis 的环境里（本地 Docker、CI 的 service 容器）
     必须让这批用例真的跑一次。
 
-    连不上真实 Redis 时**跳过并说明原因**，绝不让它变成静默通过。
+    连不上真实 Redis 时：默认**跳过并说明原因**（本地无 Redis 仍可跑全量）；
+    但若设置了 ``CG_REQUIRE_REAL_REDIS=1``，则改为**失败** ——
+    这样 CI 不会因为「Redis service 没起来」而拿到一个假绿灯。
     """
     if request.param == "fake":
         yield FakeRedis()
@@ -142,18 +154,27 @@ def any_redis(request: pytest.FixtureRequest) -> Iterator[Any]:
         return
 
     # ---- real：真实 Redis ----
+    def _unavailable(reason: str) -> None:
+        """按 CG_REQUIRE_REAL_REDIS 决定「跳过」还是「失败」。"""
+        if _REQUIRE_REAL_REDIS:
+            pytest.fail(
+                f"要求真实 Redis（CG_REQUIRE_REAL_REDIS=1）但不可用：{reason}。"
+                "替身无法发现 Lua 下标/key 布局错误，因此这不能当作通过。"
+            )
+        pytest.skip(reason)
+
     if not _REAL_REDIS_URL:
-        pytest.skip("未设置 CG_TEST_REDIS_URL，跳过真实 Redis 用例")
+        _unavailable("未设置 CG_TEST_REDIS_URL")
     try:
         import redis as _redis
     except ImportError:  # pragma: no cover - 依赖缺失
-        pytest.skip("未安装 redis 客户端库")
+        _unavailable("未安装 redis 客户端库")
 
     client = _redis.Redis.from_url(_REAL_REDIS_URL, decode_responses=True)
     try:
         client.ping()
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"真实 Redis 不可达（{_REAL_REDIS_URL}）：{type(exc).__name__}")
+        _unavailable(f"真实 Redis 不可达（{_REAL_REDIS_URL}）：{type(exc).__name__}")
     client.flushdb()
     try:
         yield client
@@ -175,12 +196,14 @@ def fakeredis_client() -> Any:
 def pytest_report_header(config: pytest.Config) -> list[str]:
     """在测试头部打印后端信息，便于判断跳过了哪些用例。"""
     real_state = "已设置（真实 Redis 用例会执行）" if _REAL_REDIS_URL else "未设置（真实 Redis 用例将跳过）"
+    enforce = "开启（不可用即失败）" if _REQUIRE_REAL_REDIS else "关闭（不可用则跳过）"
     return [
         f"costgovernor 测试后端：FakeRedis 替身（内置）+ "
         f"fakeredis={'可用' if _FAKEREDIS_CLIENT is not None else '不可用'}",
         f"CG_TEST_REDIS_URL：{real_state}",
-        "提示：替身只能验证 Lua 的语义契约，无法验证 Lua 语法；"
-        "要覆盖语法必须在有真实 Redis 的环境运行（见 README「已知限制」）。",
+        f"CG_REQUIRE_REAL_REDIS：{enforce}",
+        "提示：替身只能验证 Lua 的语义契约，无法验证 Lua 语法与下标；"
+        "真实 Redis 那一档不可省（见 README 第 6 节记录过的 4 个真实缺陷）。",
     ]
 
 
