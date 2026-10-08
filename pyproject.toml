@@ -22,9 +22,9 @@ classifiers = [
 ]
 dependencies = [
   "redis>=5.0",
-  "pydantic>=2.7",
-  "pydantic-settings>=2.2",
-  "structlog>=24.1",
+  "pydantic>=2.13.5",
+  "pydantic-settings>=2.15.0",
+  "structlog>=26.1.0",
 ]
 
 [project.optional-dependencies]
