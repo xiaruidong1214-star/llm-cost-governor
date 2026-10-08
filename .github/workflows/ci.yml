@@ -5,12 +5,15 @@ on:
     branches: ["**"]
   pull_request:
 
-# CI 中不依赖真实 Redis：
-# 全部测试通过 tests/conftest.py 里的 FakeRedis 替身完成，
-# fakeredis 只在显式设置 CG_TEST_REDIS_URL 时才会被使用（默认不设置）。
+# CI 中的 Redis：本仓库的 Lua 脚本必须**在真实 Redis 上**验证。
+# 原因：FakeRedis / fakeredis 是按脚本文本分派到等价 Python 实现的替身，
+# 它验证的是「语义契约」，无法发现 Lua 下标错位、key 折叠这类问题
+# （真实踩到过：naxes 公式错、总账写轴名而非轴取值、token 总账 key 与 token 轴 key 折叠）。
+# 因此这里起一个 Redis service，并通过 CG_TEST_REDIS_URL 打开 [real] 参数化用例。
 env:
   PYTHONIOENCODING: utf-8
   PYTHONDONTWRITEBYTECODE: "1"
+  CG_TEST_REDIS_URL: redis://127.0.0.1:6379/15
 
 jobs:
   test:
@@ -20,6 +23,16 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,12 +46,26 @@ jobs:
       - name: 代码风格
         # 与姊妹项目 code-review-bot 使用同一套规则集（见 pyproject.toml 的 [tool.ruff]）
         run: ruff check costgovernor tests
-      - name: 运行测试
-        run: python -m pytest -q
+      - name: 运行测试（含真实 Redis 用例）
+        run: python -m pytest -q -rs
       - name: CLI 冒烟测试
         run: |
           python -m costgovernor.cli --help
           python -m costgovernor.cli price-check --model deepseek-flash
+      - name: 断言真实 Redis 用例没有被全部跳过
+        # 防止「service 挂了导致 [real] 全跳过」被当成绿灯放过去
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-m", "pytest", "-q", "--collect-only", "-k", "real"],
+              capture_output=True, text=True, encoding="utf-8",
+          ).stdout
+          n = sum(1 for line in out.splitlines() if "[real]" in line)
+          print(f"收集到 {n} 个 [real] 用例")
+          if n == 0:
+              sys.exit("没有收集到任何 [real] 用例：CG_TEST_REDIS_URL 或固件参数可能失效")
+          PY
 
   docker-build:
     name: docker build

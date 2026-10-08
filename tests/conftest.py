@@ -110,23 +110,57 @@ def small_sample_settings(settings: Settings) -> Settings:
     return settings.model_copy(update={"min_sample_size": 5})
 
 
-@pytest.fixture(params=["fake", "fakeredis"])
+@pytest.fixture(params=["fake", "fakeredis", "real"])
 def any_redis(request: pytest.FixtureRequest) -> Iterator[Any]:
-    """参数化两种后端：自家替身 + fakeredis（不可用时跳过该参数）。
+    """参数化三种后端：自家替身 + fakeredis + **真实 Redis**。
 
-    两种后端跑同一批断言，可以避免「只在替身上正确」的实现。
+    三种后端跑同一批断言，可以避免「只在替身上正确」的实现。
+
+    ``real`` 分支是有意保留的：替身里的 ``eval`` 不是 Lua 解释器，
+    它只能验证**语义契约**，无法验证 Lua **语法**是否合法、KEYS/ARGV 下标是否越界
+    （越界在真实 Redis 上会直接报错，而在替身里可能被静默容忍）。
+    因此在有真实 Redis 的环境里（本地 Docker、CI 的 service 容器）
+    必须让这批用例真的跑一次。
+
+    连不上真实 Redis 时**跳过并说明原因**，绝不让它变成静默通过。
     """
     if request.param == "fake":
         yield FakeRedis()
         return
-    if _FAKEREDIS_CLIENT is None:
-        pytest.skip("fakeredis 及其 Lua 支持（lupa）不可用")
-    client = fakeredis_client()
+
+    if request.param == "fakeredis":
+        if _FAKEREDIS_CLIENT is None:
+            pytest.skip("fakeredis 及其 Lua 支持（lupa）不可用")
+        client = fakeredis_client()
+        try:
+            yield client
+        finally:
+            try:
+                client.flushall()
+            except Exception:  # noqa: BLE001 - 清理失败不影响断言结果
+                pass
+        return
+
+    # ---- real：真实 Redis ----
+    if not _REAL_REDIS_URL:
+        pytest.skip("未设置 CG_TEST_REDIS_URL，跳过真实 Redis 用例")
+    try:
+        import redis as _redis
+    except ImportError:  # pragma: no cover - 依赖缺失
+        pytest.skip("未安装 redis 客户端库")
+
+    client = _redis.Redis.from_url(_REAL_REDIS_URL, decode_responses=True)
+    try:
+        client.ping()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"真实 Redis 不可达（{_REAL_REDIS_URL}）：{type(exc).__name__}")
+    client.flushdb()
     try:
         yield client
     finally:
         try:
-            client.flushall()
+            client.flushdb()
+            client.close()
         except Exception:  # noqa: BLE001 - 清理失败不影响断言结果
             pass
 
@@ -140,12 +174,14 @@ def fakeredis_client() -> Any:
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
     """在测试头部打印后端信息，便于判断跳过了哪些用例。"""
-    lines = [f"costgovernor 测试后端：FakeRedis 替身（内置）+ fakeredis={'可用' if _FAKEREDIS_CLIENT else '不可用'}"]
-    if _REAL_REDIS_URL:
-        lines.append(f"CG_TEST_REDIS_URL 已设置：{_REAL_REDIS_URL}（尝试真实 Redis）")
-    else:
-        lines.append("未设置 CG_TEST_REDIS_URL：全部测试均为内存/纯函数，无网络请求")
-    return lines
+    real_state = "已设置（真实 Redis 用例会执行）" if _REAL_REDIS_URL else "未设置（真实 Redis 用例将跳过）"
+    return [
+        f"costgovernor 测试后端：FakeRedis 替身（内置）+ "
+        f"fakeredis={'可用' if _FAKEREDIS_CLIENT is not None else '不可用'}",
+        f"CG_TEST_REDIS_URL：{real_state}",
+        "提示：替身只能验证 Lua 的语义契约，无法验证 Lua 语法；"
+        "要覆盖语法必须在有真实 Redis 的环境运行（见 README「已知限制」）。",
+    ]
 
 
 # ======================================================================================

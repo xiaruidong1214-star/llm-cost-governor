@@ -343,17 +343,16 @@ Hash field 是 `session:module` 这种永久增长的结构；模块成本从 Ha
 
 ## 4. 已知限制（诚实清单）
 
-这一版在无 Redis、无 Docker、无外网 LLM API 的环境里开发与验证，因此以下事项
-**没有被真实验证**，或者本身就是设计上的已知取舍：
-
-1. **Lua 脚本没有在真实 Redis 上跑过**。本机没有 Redis 服务，也没有 `lupa`
-   （fakeredis 的 EVAL 依赖它，所以 fakeredis 参数被自动跳过，
-   见 `tests/conftest.py::_fakeredis_or_none` 与 pytest 输出里的 16 个 skip）。
-   脚本语义由 `costgovernor/testing.py::InMemoryRedis` 用等价的 Python 实现验证，
-   另外有一组**静态契约测试**锁住 KEYS/ARGV 下标（`test_lua_key_indices_stay_in_range`、
-   `test_lua_argument_layout_matches_python`）。**真实 Redis 上的首次运行仍需人工确认。**
+1. ~~**Lua 脚本没有在真实 Redis 上跑过**~~ → **已在真实 Redis 上验证，并因此发现了 4 个真 bug**
+   （见 §6「真实 Redis 验证发现的缺陷」）。现在测试固件 `any_redis` 有第三个参数 `real`：
+   设置了 `CG_TEST_REDIS_URL` 就会真的连上去跑同一批断言，本地 236 passed / 20 skipped，
+   CI 里也起了 `redis:7-alpine` service 来跑这批用例。
+   **仍然保留的缺口**：`fakeredis` 参数因为本机没有 `lupa` 而被跳过
+   （`tests/conftest.py::_fakeredis_or_none`），所以「第三种后端」目前只有替身与真实 Redis 两种。
 2. **`InMemoryRedis.eval` 不是 Lua 解释器**：它按脚本文本的标记注释分派到 Python 分支。
-   它验证的是「语义契约」，不是「Lua 语法」。语法错误只能在真实 Redis 上暴露。
+   它验证的是「语义契约」，不是「Lua 语法」。**这正是上面 4 个 bug 曾经长期隐身的原因**——
+   替身掩盖了真实 Lua 里的下标与 key 布局错误。凡是改动 Lua 的提交，都必须在有真实 Redis 的
+   环境里跑一次 `pytest`，否则等于没测。
 3. **没有多实例高并发压测**。幂等与滑窗的正确性靠「Lua 原子执行」这个设计保证，
    但 10k QPS 下的延迟、`EVAL` 的 CPU 占用、大 key（一个月 30 个分桶）的扫描成本
    都没有实测数据。
@@ -408,20 +407,59 @@ zadd / zremrangebyscore / zcard / zrange / keys / pipeline / eval`。
 
 ---
 
-## 6. 测试
+## 6. 真实 Redis 验证发现的缺陷（说明为什么这一步不能省）
 
-### 6.1 运行
+这一节记录**在真实 Redis 上首次运行测试时暴露出来的 4 个真 bug**。
+它们在 `InMemoryRedis` 替身上全部"通过"，因为替身按脚本标记分派到等价的 Python 语义，
+**不执行真正的 Lua**，所以下标错位、key 折叠这类问题完全看不见。
+
+| # | 缺陷 | 现象 | 根因 | 修复 |
+|---|---|---|---|---|
+| 1 | `naxes` 公式少算一半 | `llm:days:cost` 里出现 `'model'`，而 `llm:cost:...:module` 里出现日期；`known_axes()` 返回 `[]` | 把 `naxes` 写成 `(#KEYS-4)/2` / `(#KEYS-5)/2`，而轴分账 key 实际是**连续的 naxes 个** | 改为 `naxes = #KEYS - 4`（V1）/ `(#KEYS-5)/2`（V2），并加 `math.floor` 防止浮点导致循环体不执行 |
+| 2 | 总账与分账用「轴**名**」而不是「轴**取值**」做 field | 成本被记到 `{'model': 0.5}`，按 `deepseek-flash` 查不到 | 脚本里把 ARGV 的轴名/轴取值下标写反（V1 的轴取值在 `ARGV[8]`，V2 在 `ARGV[11]`） | 用「同一个调用里并排打印 Python 侧 argv 编号与 Lua 实收 ARGV」的方式钉死下标 |
+| 3 | 天索引与轴名索引写反 | 日期写进了轴名集合，轴名写进了日期集合 | `KEYS[3+naxes]`（days）与 `KEYS[4+naxes]`（axes）被对调 | 按 Python 侧 keys 构造顺序改正，并加测试断言两个集合的成员 |
+| 4 | `naxes=1` 时 token 总账 key 与 token 轴 key **折叠成同一个物理 key** | 同一份 token 被记两次，token 总账语义被破坏 | KEYS 排列让 `KEYS[5+naxes]` 与 `KEYS[5+naxes+1]` 指向同一 key | 按 `5 keys + 2naxes` 重排，并加测试断言 `token_total not in token_axis_keys` |
+
+**方法论上的教训**（比 bug 本身更重要）：
+
+* **自洽的契约测试抓不住这类错误**。原有 `test_lua_key_indices_stay_in_range` 用 Python 里
+  *同样的公式*去验证公式，所以公式本身错时它照样通过。现在补的测试把断言钉在
+  **真实 argv/keys 的内容**上（例如「总账 field 必须等于维度取值」「token 总账 key 不能等于 token 轴 key」）。
+* **不能靠读注释推断下标**。本文件的 Lua 注释原本就把 ARGV 布局写错了，
+  照注释推导只会得出错误结论。可靠做法是**在运行期对同一次调用同时观测两侧**。
+* **替身的价值是"快速回归"，不是"证明正确"**。凡是 `EVAL` 的改动，
+  必须在真实 Redis 上跑一遍才算验证过——这也是 CI 里挂 `redis:7-alpine` service 的原因。
+
+---
+
+## 7. 测试
+
+### 7.1 运行
 
 ```bash
-python -m pytest -q            # 全量
-python -m pytest -q -rA        # 带 skip 原因
+python -m pytest -q                # 全量（替身后端）
+CG_TEST_REDIS_URL=redis://127.0.0.1:6379/15 python -m pytest -q -rs
+                                   # 额外加上 [real] 参数：在真实 Redis 上跑同一批断言
 ```
 
-**不依赖任何外部服务**：没有真实 Redis、没有网络请求、没有 Docker。
-默认后端是内置的 `InMemoryRedis` 替身；`fakeredis` 参数只在它**支持 EVAL** 时才会参与
+**默认不依赖任何外部服务**：默认后端是内置的 `InMemoryRedis` 替身；
+`fakeredis` 参数只在它**支持 EVAL** 时才会参与
 （当前环境缺 `lupa`，因此自动跳过，并在 pytest 头部与 `-rA` 输出里说明原因）。
+设置 `CG_TEST_REDIS_URL` 后会追加第三个参数 `real`，**真实执行 Lua**。
 
-### 6.2 覆盖的回归点（与缺陷一一对应）
+实测结果：
+
+| 模式 | 结果 |
+|---|---|
+| 仅替身（不设 `CG_TEST_REDIS_URL`） | `216 passed, 40 skipped` |
+| 含真实 Redis | `236 passed, 20 skipped` |
+
+CI（`.github/workflows/ci.yml`）会起 `redis:7-alpine` service 并设置
+`CG_TEST_REDIS_URL`，因此 CI 跑的是**含真实 Redis** 的那一档。
+另有一个断言步骤检查 `[real]` 用例数量不为 0，防止「service 挂了导致全部跳过」
+被当成绿灯放过去。
+
+### 7.2 覆盖的回归点（与缺陷一一对应）
 
 | 缺陷 | 主要回归测试 |
 |---|---|
@@ -432,7 +470,7 @@ python -m pytest -q -rA        # 带 skip 原因
 | 5 无 TTL、无分桶、总账与分账对不平 | `test_storage.py`（`test_keys_are_daily_bucketed`、`test_all_keys_have_ttl`、`test_ttl_actually_expires`、`test_total_and_split_stay_balanced`、`test_dedup_ttl_is_at_least_bucket_ttl`）、`test_analytics.py`（`test_split_check_is_balanced_after_many_writes`、`test_split_check_detects_drift`、`test_reconcile_detects_difference`） |
 | 6 装饰器吞掉 async 与失败调用 | `test_tracker.py`（`test_async_function_is_supported`、`test_async_exception_is_reraised_and_recorded`、`test_sync_exception_is_reraised_and_recorded`、`test_usage_object_response`、`test_estimated_flag_when_usage_missing`、`test_recorder_and_ledger_errors_do_not_break_business`、`test_logger_is_created_without_print`） |
 
-### 6.3 覆盖率现状
+### 7.3 覆盖率现状
 
 本机的 `.pylibs` 里没有 `pytest-cov`，所以自带了一个最小行覆盖探针
 （`tools/coverage_probe.py`，基于 `sys.settrace`，是**近似**指标：只看行是否被执行，
@@ -466,7 +504,7 @@ Celery worker 真正的重试/死信路径、以及替身里为「将来可能�
 
 ---
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 llm-cost-governor/
@@ -495,7 +533,7 @@ llm-cost-governor/
 
 ---
 
-## 8. 环境变量
+## 9. 环境变量
 
 全部以 `CG_` 为前缀（见 `.env.example`），常用的几项：
 
@@ -518,6 +556,6 @@ llm-cost-governor/
 
 ---
 
-## 9. 许可
+## 10. 许可
 
 MIT，见 [LICENSE](LICENSE)。

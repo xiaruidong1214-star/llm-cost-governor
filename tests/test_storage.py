@@ -515,3 +515,173 @@ def test_keyspace_custom_prefix(fake_redis) -> None:
     ledger = IdempotentLedger(fake_redis, settings_like, keyspace=custom)
     assert custom.bucket_key("cost", DAY) == "myapp:cost:2026-10-08"
     assert ledger.keyspace is custom
+
+
+# ======================================================================================
+# 下标契约的**强**版本
+#
+# 上面 test_lua_key_indices_stay_in_range 是「自洽性」检查：它用 Python 里同样的
+# 公式去验证公式，因此在公式本身写错时**依然通过**。真实踩到的三个 bug 都属于这一类：
+#
+#   1. naxes 少算一半（写成 (#KEYS-4)/2、(#KEYS-5)/2），
+#      导致天索引被写进第 2 个轴的维度 key、轴名索引被写进天索引 key；
+#   2. 分账/总账用「轴名」而不是「轴取值」做 field，于是成本记到 {'model': ...} 上；
+#   3. naxes=1 时 token 总账 key 与 token 轴 key 折叠成同一个物理 key。
+#
+# 下面这些测试把公式**钉死在真实 argv/keys 的内容上**，而不是钉在公式自身，
+# 因此任何一处回归都会失败 —— 且不依赖真实 Redis。
+# ======================================================================================
+
+
+def _last_eval(fake_redis) -> tuple[object, list[str], list]:
+    """取出最后一次 EVAL 的 (script, keys, argv)。
+
+    ``InMemoryRedis.eval_calls`` 存的是 ``(script, values)``，keys 与 argv 合并在
+    ``values`` 里，切分点由 ``eval_numkeys`` 给出。
+    """
+    script, values = fake_redis.eval_calls[-1]
+    numkeys = fake_redis.eval_numkeys[-1]
+    keys = [str(item) for item in values[:numkeys]]
+    argv = list(values[numkeys:])
+    return script, keys, argv
+
+
+def _axis_pairs(argv: list, *, with_tokens: bool) -> list[tuple[str, str]]:
+    """从 argv 尾部切出 (轴名, 轴取值) 对。
+
+    V1（无 token）轴对从下标 6 起；V2 因多出 3 个 token 参数，从下标 9 起。
+    """
+    start = 9 if with_tokens else 6
+    tail = argv[start:]
+    return [(str(tail[i]), str(tail[i + 1])) for i in range(0, len(tail) - 1, 2)]
+
+
+def test_v1_naxes_equals_number_of_axes(fake_redis, settings) -> None:
+    """V1 的 naxes 必须等于真正的轴数量（而不是它的一半）。"""
+    ledger = IdempotentLedger(fake_redis, settings)
+    ledger.add_entry(
+        "t-v1-naxes", "1", dimension="deepseek-flash", at=DAY_DATETIME,
+        dimensions={"module": "report", "tenant": "acme"},
+    )
+    script, keys, argv = _last_eval(fake_redis)
+    assert script is IDEMPOTENT_ACCRUAL_LUA
+    axes = _axis_pairs(argv, with_tokens=False)
+    assert len(axes) == 3
+    # V1：naxes = #KEYS - 4，必须等于轴数量
+    assert len(keys) - 4 == len(axes)
+    # 且第一对必须是 (model, deepseek-flash)，顺序不能乱
+    assert axes[0] == ("model", "deepseek-flash")
+
+
+def test_v2_naxes_equals_number_of_axes(fake_redis, settings) -> None:
+    """V2 的 naxes 必须等于真正的轴数量；且 token 总账与 token 轴 key 不得折叠。"""
+    ledger = IdempotentLedger(fake_redis, settings)
+    ledger.add_entry(
+        "t-v2-naxes", "1", dimension="deepseek-flash", at=DAY_DATETIME,
+        dimensions={"module": "report"},
+        tokens={"cache_hit": 1},
+    )
+    script, keys, argv = _last_eval(fake_redis)
+    assert script is IDEMPOTENT_ACCRUAL_LUA_V2
+    axes = _axis_pairs(argv, with_tokens=True)
+    assert axes[0] == ("model", "deepseek-flash")
+    assert [name for name, _ in axes] == ["model", "module"]
+
+    # naxes 由 KEYS 数量推导（脚本自己的公式），并必须与真实轴数量一致
+    naxes = (len(keys) - 5) // 2
+    assert naxes == len(axes) == 2
+    # 9 个 key：dedup / 总账 / 2 个金额分账 / 天索引 / 轴名索引 / token 总账 / 2 个 token 分账
+    assert len(keys) == 9
+
+    # 关键不变式：token 总账 key 与每个 token 轴 key 必须是**不同的**物理 key。
+    # 用负索引表达位置关系，避免依赖对 naxes 的算术推导（那种推导正是最初出错的来源）：
+    #   ... 轴名索引, token 总账, token 轴1, token 轴2  <- 末尾三个是 tokens 相关
+    assert keys[-3] == ledger.keyspace.tokens_bucket_key("cost", DAY)
+    token_total = keys[-3]
+    token_axis_keys = keys[-2:]
+    assert len(token_axis_keys) == 2
+    assert token_total not in token_axis_keys
+    assert len(set(token_axis_keys)) == 2
+
+    # 天索引与轴名索引必须是不同 key，且都不是任何维度分账 key
+    day_index = keys[-5]
+    axis_index = keys[-4]
+    assert day_index == ledger.keyspace.day_index_key("cost")
+    assert axis_index == ledger.keyspace.axis_index_key("cost")
+    assert day_index != axis_index
+    dimension_keys = keys[2:4]  # 两个金额分账 key
+    assert day_index not in dimension_keys
+    assert axis_index not in dimension_keys
+
+
+def test_lua_writes_axis_VALUE_not_axis_name(any_redis, settings) -> None:
+    """最强的一条：分账 field 必须是轴**取值**，不是轴名。
+
+    这是真实踩到的 bug —— 脚本把 'model'（轴名）当作 field，
+    于是所有成本都被记到 {'model': ...} 上，而报表按 deepseek-flash 查不到。
+
+    用 ``any_redis`` 参数化：替身与真实 Redis 都要通过。
+    """
+    ledger = IdempotentLedger(any_redis, settings)
+    ledger.add_entry("t-value", "0.5", dimension="deepseek-flash", at=DAY_DATETIME)
+
+    # 总账 field == 维度值
+    assert ledger.bucket_total(DAY) == _q("0.5")
+    totals_hash = any_redis.hgetall(ledger.keyspace.bucket_key("cost", DAY))
+    assert set(totals_hash) == {"deepseek-flash"}, f"总账 field 应为轴取值，实际 {set(totals_hash)}"
+
+    # 维度分账 field 同样是维度值
+    dimension_hash = any_redis.hgetall(ledger.keyspace.dimension_key("cost", DAY, "model"))
+    assert set(dimension_hash) == {"deepseek-flash"}
+    assert ledger.dimension_totals(DAY, axis="model") == {"deepseek-flash": _q("0.5")}
+
+
+def test_index_sets_receive_the_right_members(any_redis, settings) -> None:
+    """天索引里必须是日期，轴名索引里必须是轴名 —— 两者曾被写反。"""
+    ledger = IdempotentLedger(any_redis, settings)
+    ledger.add_entry(
+        "t-index", "1", dimension="deepseek-flash", at=DAY_DATETIME,
+        dimensions={"module": "report"},
+    )
+
+    days = any_redis.smembers(ledger.keyspace.day_index_key("cost"))
+    axes = any_redis.smembers(ledger.keyspace.axis_index_key("cost"))
+    assert {str(d) for d in days} == {"2026-10-08"}, f"天索引内容错误: {days}"
+    assert {str(a) for a in axes} == {"model", "module"}, f"轴名索引内容错误: {axes}"
+
+    # 读接口必须能据此还原
+    assert ledger.known_days() == [DAY]
+    assert sorted(ledger.known_axes()) == ["model", "module"]
+
+
+def test_multi_axis_split_sums_to_total(any_redis, settings) -> None:
+    """多轴场景下，每个轴的分账之和都等于总账（结构性保证，而不是事后配平）。"""
+    ledger = IdempotentLedger(any_redis, settings)
+    for index, (model, amount) in enumerate(
+        {"deepseek-flash": "0.3", "deepseek-v4-pro": "1.7", "deepseek-flash-vision": "2.0"}.items()
+    ):
+        ledger.add_entry(
+            f"t-mix-{index}", amount, dimension=model, at=DAY_DATETIME,
+            dimensions={"module": "report" if index % 2 == 0 else "chat"},
+        )
+
+    total = ledger.bucket_total(DAY)
+    assert total == _q("4.0")
+    assert sum(ledger.dimension_totals(DAY, axis="model").values(), Decimal(0)) == total
+    assert sum(ledger.dimension_totals(DAY, axis="module").values(), Decimal(0)) == total
+    assert sorted(ledger.known_axes()) == ["model", "module"]
+    assert ledger.known_days() == [DAY]
+
+
+def test_token_total_key_gets_all_three_fields(any_redis, settings) -> None:
+    """naxes=1 时 token 总账 key 不能被 token 轴 key 吞掉（真实踩到的折叠 bug）。"""
+    ledger = IdempotentLedger(any_redis, settings)
+    ledger.add_entry(
+        "t-tok", "1", dimension="deepseek-flash", at=DAY_DATETIME,
+        tokens={"cache_hit": 1000, "cache_miss": 2000, "output": 500},
+    )
+    tokens = ledger.token_grand_totals(DAY)
+    assert tokens["cache_hit_tokens"] == _q("1000")
+    assert tokens["cache_miss_tokens"] == _q("2000")
+    assert tokens["output_tokens"] == _q("500")
+

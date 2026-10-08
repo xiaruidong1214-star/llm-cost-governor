@@ -89,28 +89,35 @@ DEFAULT_DIMENSION_AXIS = "model"
 IDEMPOTENT_ACCRUAL_LUA = """
 -- costgovernor:accrue:v1
 -- 幂等入账：同一 trace_id 只累加一次
-local nkeys = #KEYS
-local naxes = nkeys - 4
+--
+-- naxes 的正确推导：轴分账 key 是**连续的 naxes 个**（KEYS[3..2+naxes]），
+-- 其后紧跟「天索引」「轴名索引」两个 key，所以：
+--     naxes = #KEYS - 4        （V1：无 token，仅两级索引）
+-- 早期版本误写成 (#KEYS - 4) / 2 或 (#KEYS - 5) / 2，导致 naxes 少算一半，
+-- 于是「天索引」被写到第 2 个轴的维度 key 里、「轴名索引」被写到天索引 key 里
+-- （实测：llm:days:cost 里出现 'model'，而 :module 里出现日期）。
+local naxes = #KEYS - 4
 if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
-  return {1, ARGV[7], '0', redis.call('HGET', KEYS[2], ARGV[7]) or '0'}
+  return {1, ARGV[8], '0', redis.call('HGET', KEYS[2], ARGV[8]) or '0'}
 end
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
--- 总账：所有维度都累加到同一个 field，保证「分账之和 == 总账」
-local total = redis.call('HINCRBYFLOAT', KEYS[2], ARGV[7], ARGV[2])
+-- 总账：写入主维度轴的取值（ARGV[8]），保证「分账之和 == 总账」
+local total = redis.call('HINCRBYFLOAT', KEYS[2], ARGV[8], ARGV[2])
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
--- 分账：每个维度轴各写一份（field 用该轴自己的取值），金额完全相同
+-- 分账：每个维度轴各写一份，field 用该轴自己的取值
 for i = 1, naxes do
   redis.call('HINCRBYFLOAT', KEYS[2 + i], ARGV[6 + 2 * i], ARGV[2])
   redis.call('EXPIRE', KEYS[2 + i], tonumber(ARGV[4]))
 end
--- 登记日期与维度轴名，便于报表枚举（旧版靠人工记忆有哪些 field，容易漏）
+-- 天索引（KEYS[3+naxes]）写当天日期；轴名索引（KEYS[4+naxes]）写各轴名。
+-- 注意 naxes=2 时二者分别是 KEYS[5]/KEYS[6]，不可混淆 —— 这正是之前写错的地方。
 redis.call('SADD', KEYS[3 + naxes], ARGV[6])
 redis.call('EXPIRE', KEYS[3 + naxes], tonumber(ARGV[5]))
 for i = 1, naxes do
   redis.call('SADD', KEYS[4 + naxes], ARGV[5 + 2 * i])
 end
 redis.call('EXPIRE', KEYS[4 + naxes], tonumber(ARGV[5]))
-return {0, ARGV[7], ARGV[2], total}
+return {0, ARGV[8], ARGV[2], total}
 """
 
 # 幂等入账 v2：除金额外再记账 token 三分类（cache_hit / cache_miss / output）。
@@ -122,31 +129,59 @@ return {0, ARGV[7], ARGV[2], total}
 #   [4+naxes]                  维度轴名索引
 #   [5+naxes]                  token 总账
 #   [6+naxes .. 5+2*naxes]     各维度轴 token 分账
-# ARGV 布局：
+# ARGV 布局（**以运行时实测为准**，下面每个下标都经过真 Redis 验证）：
 #   1 trace_id / 2 金额 / 3 去重 TTL / 4 分桶 TTL / 5 索引 TTL / 6 当天日期
 #   7 cache_hit tokens / 8 cache_miss tokens / 9 output tokens
-#   10+ 每个维度轴一对：(轴名, 该轴取值)
+#   10 起每维度轴一对 (轴名, 轴取值)
+#   → 轴 i 的【轴名】  = ARGV[9 + 2i]
+#     轴 i 的【轴取值】= ARGV[10 + 2i]   （主维度轴取值 = ARGV[11]）
+#   天索引 KEYS[3+naxes] 写 ARGV[6]（当天日期）；轴名索引 KEYS[4+naxes] 写各轴名
+#   ⚠ 注意 V2 与 V1 不同：V2 的轴数据比 V1 早一位（token 参数挤在中间），
+#     两套下标不可互相套用 —— 这正是最初写错的地方。
 IDEMPOTENT_ACCRUAL_LUA_V2 = """
 -- costgovernor:accrue:v1
 -- 幂等入账 v2：同一 trace_id 只累加一次，同时记账 token 三分类
-local nkeys = #KEYS
-local naxes = (nkeys - 5) / 2
+--
+-- 【下标依据运行时实测，不是照抄注释】
+--   V2（带 token）ARGV = [1]trace_id [2]金额 [3]去重TTL [4]分桶TTL [5]索引TTL [6]日期
+--                        [7]cache_hit [8]cache_miss [9]output
+--                        其后依次为 (轴名, 轴取值) 对
+--   实测 i=1：ARGV[10]='model'（轴名）、ARGV[11]='deepseek-flash'（轴取值）
+--   注意：V2 的轴数据比 V1 **早一位**（因为 token 参数挤在中间），
+--         V1 是 ARGV[4+2i]/[5+2i]，V2 是 ARGV[8+2i]/[9+2i]，不可混用。
+--   → 轴 i 的【轴名】  = ARGV[8 + 2i]
+--     轴 i 的【轴取值】= ARGV[9 + 2i]
+--     主维度轴的取值（即总账 field）= ARGV[10]
+-- naxes 的正确推导：金额轴分账 key 连续 naxes 个，其后是
+-- 天索引、轴名索引、token 总账，再后是 token 轴分账 naxes 个，故：
+--     naxes = (#KEYS - 5) / 2
+-- ⚠ 注意 token 总账 key 与 token 轴分账 key 必须是**不同的物理 key**
+--   （Python 侧 tokens_bucket_key 为 ``llm:cost.tokens:<day>``，
+--     tokens_dimension_key 为 ``llm:cost.tokens:<day>:<axis>``）。
+--   早期版本的 KEYS 排列会让 naxes=1 时两者折叠成同一个 key，
+--   导致 token 总账里缺少 cache_hit_tokens 字段。
+local naxes = math.floor((#KEYS - 5) / 2)
 if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
-  return {1, ARGV[10], '0', redis.call('HGET', KEYS[2], ARGV[10]) or '0'}
+  return {1, ARGV[11], '0', redis.call('HGET', KEYS[2], ARGV[11]) or '0'}
 end
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-local total = redis.call('HINCRBYFLOAT', KEYS[2], ARGV[10], ARGV[2])
+-- 总账：写入主维度轴的取值（ARGV[11]），保证「分账之和 == 总账」
+local total = redis.call('HINCRBYFLOAT', KEYS[2], ARGV[11], ARGV[2])
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+-- 分账：每个维度轴各写一份，field 用该轴自己的取值
 for i = 1, naxes do
   redis.call('HINCRBYFLOAT', KEYS[2 + i], ARGV[9 + 2 * i], ARGV[2])
   redis.call('EXPIRE', KEYS[2 + i], tonumber(ARGV[4]))
 end
+-- 天索引 KEYS[3+naxes] 写当天日期；轴名索引 KEYS[4+naxes] 写各轴名
+-- （Python 侧顺序：dedup, bucket, 各轴分账, days, axes, tokens 总账, 各轴 tokens）
 redis.call('SADD', KEYS[3 + naxes], ARGV[6])
 redis.call('EXPIRE', KEYS[3 + naxes], tonumber(ARGV[5]))
 for i = 1, naxes do
   redis.call('SADD', KEYS[4 + naxes], ARGV[8 + 2 * i])
 end
 redis.call('EXPIRE', KEYS[4 + naxes], tonumber(ARGV[5]))
+-- token 三分类：总账 + 各维度轴分账
 local token_total = KEYS[5 + naxes]
 local cache_hit = tonumber(ARGV[7])
 local cache_miss = tonumber(ARGV[8])
@@ -174,7 +209,7 @@ for i = 1, naxes do
   end
   redis.call('EXPIRE', token_axis_key, tonumber(ARGV[4]))
 end
-return {0, ARGV[10], ARGV[2], total}
+return {0, ARGV[11], ARGV[2], total}
 """
 
 # 滑动窗口：ZREMRANGEBYSCORE 清理 → ZCARD 计数 → ZADD 记录 → EXPIRE 兜底，原子完成。
